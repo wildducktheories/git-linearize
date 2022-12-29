@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+
+set -o pipefail
+
+COMMAND=git-linearize
+DEBUG=${DEBUG:-false}
+GIT_EDITOR="cat"
+
+die() {
+  echo "fatal: $COMMAND: $*" 1>&2
+  exit 1
+}
+
+info() {
+  echo "info: $COMMAND: $*" 1>&2
+}
+
+warning() {
+  echo "warning: $COMMAND: $*" 1>&2
+}
+
+error() {
+  echo "warning: $COMMAND: $*" 1>&2
+}
+
+debug() {
+  if $DEBUG; then
+    echo "debug: $COMMAND: $*" 1>&3
+  fi
+}
+
+dispatch() {
+  local cmd=$1
+  shift 1
+  if test "$(type -t "_$cmd")" = "function"; then
+    "_$cmd" "$@"
+  else
+    die "'$cmd' is not a valid command"
+  fi
+}
+
+_atomic() {
+  debug "atomic: $*"
+  local branch=$(git branch --show-current)
+  local head=$(git rev-parse HEAD)
+  local stash
+  local err
+  local rc
+
+  if ! git diff HEAD --exit-code >/dev/null; then
+    stash=$(git stash create) || die "atomic: cannot create entry stash"
+  fi
+
+  (
+    cd $(git rev-parse --show-toplevel)
+    dispatch "$@"
+  )
+  rc=$?
+
+  err=$(
+    (
+      if ! git diff HEAD --exit-code > /dev/null; then
+        local exit_stash=$(git stash create)
+        if test -n "$exit_stash"; then
+          warning "purging remnant state...$exit_stash"
+          git reset -q --hard HEAD
+        fi
+      fi
+
+      if test -n "$branch"; then
+        if test "$(git rev-parse $branch)"  != "$head"; then
+          warning "restoring $branch to $head"
+          git checkout -q -B $branch $head || die "atomic: restore of branch failed"
+        else
+          git checkout -q $branch || die "atomic: restore of branch failed"
+        fi
+      else
+        git checkout -q $head^0 || die "atomic: restore of branch failed"
+      fi
+
+      if test -n "$stash"; then
+        git stash -q apply $stash
+      fi
+    ) 2>&1
+  )
+  rc=$?
+  if test -n "$err"; then
+    echo "$err" 1>&2
+  fi
+
+  test $rc -eq 0 || exit $rc
+}
+
+_reverse() {
+  let c=0
+  while read line; do
+    echo -e "$c\t$line"
+    let c=c+1
+  done | sort -nr | cut -f2
+}
+
+_short() {
+  git rev-parse --short=8 $1
+}
+
+#
+# A cherry-pick that is equivalent to:
+#
+#     git cherry-pick --allow-empty --keep-redundant-commits $commit
+#
+# except in the case of a conflict.
+#
+# If --on-conflict merge is specfied, the cherry-pick is resolved with --strategy ort -X ours
+#
+# Otherwise, the conflicted commit is replaced by two commits:
+#
+#  - the commit produced by 'git cherry-pick --strategy ort -X theirs' and
+#  - a compensating commit that modifies the tree to match the commit produced by 'git cherry-pick --strategy ort -X ours'
+#
+# The end result is that the compensations for conflicting hunks are isolated into separate commits but the
+# final result is equivalent to a cherry pick of the non-conflicting hunks only.
+#
+_cherry-pick() {
+  local c=$1
+  local ours
+
+  if ! err=$(git cherry-pick --keep-redundant-commits $c 2>&1); then
+    git cherry-pick --abort
+    err=$(git cherry-pick --allow-empty --keep-redundant-commits --strategy ort -X ours $c 2>&1) || {
+        debug "$err" 1>&2
+        git cherry-pick --abort
+        die "cherry-pick: ours failed: $(_short $c) @ $(_short HEAD)";
+    }
+    if test "${ON_CONFLICT}" = "split"; then
+      ours=$(git rev-parse HEAD)
+
+      git reset -q --hard HEAD^1 &&
+      err=$(git cherry-pick --allow-empty --keep-redundant-commits --strategy ort -X theirs $c 2>&1) || {
+        debug "$err" 1>&2;
+        git cherry-pick --abort;
+        die "cherry-pick: theirs failed: $(_short $c) @ $(_short HEAD)";
+      }
+
+      git diff --full-index HEAD $ours -- | git apply -q --index --allow-empty &&
+      git commit -q --no-verify --allow-empty -m "COMPENSATION: prefer-ours: $c" || {
+        git reset --hard HEAD
+        die "compensate: fixup diff failed: $c"
+      }
+    fi
+  fi
+}
+
+# performs a compensated rebase.
+#
+# a compensated rebase is equivalent to a --strategy ort -X ours rebase but each conflicted cherry-pick
+# is replaced by a cherry-pick using the theirs strategy option followed by a compensating commit
+# that restores the tree according to the ours strategy option.
+#
+# The end result is the same as if a merge or rebase with a --strategy ort -X ours had been
+# performed but the history now contains one additional compensating commit for each conflicted commit.
+_compensate() {
+  local onto=$(git rev-parse $1)
+  local base=$2
+  local top=$(git rev-parse $3)
+
+  if err=$(git rebase --onto $onto $base $top -q --allow-empty --keep-empty --empty=keep 2>&1); then
+    # We optimistically rebase and if it works, we assume we are good
+    return 0
+  else
+    # Otherwise, we perform compensated cherry-picks that are the equivalent of
+    #
+    #    git rebase --onto $onto $base $top -q --allow-empty --keep-empty --empty=keep --strategy ort -X ours
+    #
+    # except for the differences described in _cherry-pick
+    #
+    debug "$err"
+    git rebase --abort &&
+    git checkout -q $onto^0 &&
+    git rev-list ^$base $top --reverse -- | while read c; do
+      _cherry-pick "$c"
+    done
+  fi
+}
+
+_resolve-merge-conflict() {
+  local merge=$1
+  set -- $(git rev-list --parents -n1 $merge)
+  local left=$2
+  local right=$3
+
+
+  local saved=$(git rev-parse HEAD)
+  git checkout -q $left
+  if ! git merge -q -s ort -X ours $right > /dev/null; then
+    git merge --abort;
+    git reset --hard $saved
+    die "merge failed";
+  fi
+  git diff --full-index HEAD $merge | git apply -q --index --allow-empty &&
+  git commit --allow-empty --no-verify -q -m "COMPENSATION: resolve-merge-conflict: $merge"
+  local compensation=$(git rev-parse HEAD)
+  git checkout -q $saved
+  _compensate HEAD $compensation^1 $compensation
+  if test "$ON_CONFLICT" = "merge"; then
+    git reset --soft $saved
+    GIT_EDITOR="cat >/dev/null" git commit -q --amend
+  fi
+}
+
+_walk() {
+  local path=$1
+  local head=$2
+  shift 2
+
+  local -a limits=("$@")
+  set -- $(git rev-list -n1 $head "${limits[@]}" --parents)
+  local merge=$1
+  local left=$2
+  local right=$3
+  local list tip
+  case $# in
+    0)
+      :
+    ;;
+    2)
+      local merge=$(git rev-list $head --merges "${limits[@]}" -n1)
+      list=$(git rev-list $head ${merge:+^}$merge "${limits[@]}" --parents)
+      tip=$(echo "$list"| head -1 | cut -f1 -d' ')
+      base=$(echo "$list"| tail -1 | cut -f2 -d' ')
+      echo "compensate $base $tip"
+      if test -n "$merge"; then
+        _walk "$path" $merge "${limits[@]}"
+      fi
+    ;;
+    3)
+      git checkout -q $left
+      local broken_merge=false
+      local empty_merge=false
+
+      echo "pop  $merge $path"
+
+      if git diff --full-index $left $merge --exit-code >/dev/null; then
+        empty_merge=true
+      fi
+
+      if ! $empty_merge; then
+        git checkout -q $left
+        if ! git merge -q $right >/dev/null; then
+          # if the merge fails, there must be problem with it
+          git merge --abort
+          broken_merge=true
+        fi
+
+        if ! $broken_merge && ! git diff --exit-code HEAD $merge >/dev/null; then
+          # if the merge fails to produce the same result, there must
+          # be a problem with it
+          broken_merge=true
+        fi
+
+        if $broken_merge; then
+          echo resolve-merge-conflict "$merge"
+        fi
+        _walk "${path}R" $right "${limits[@]}" ^$left
+      else
+        debug "empty merge elimination $merge $right"
+      fi
+
+      _walk "${path}L" $left "${limits[@]}"
+      echo base $(_reduce-bases $(git rev-list $head "${limits[@]}" --boundary | grep ^- | tr -d '-'))
+      echo "push $merge $path"
+    ;;
+    1|*)
+      die "not currently supported $#"
+    ;;
+  esac
+}
+
+_pipe() {
+  local pipe=$1
+  pipe=$(echo "$pipe" | sed "s/^ */_/;s/| */|_/g")
+  eval "$pipe"
+}
+
+_reduce-bases() {
+  if test $# -le 1; then
+    echo "$@"
+  elif test $# -eq 2; then
+    if test -z "$(git rev-list $1 ^$2 -n1)"; then
+      echo $2
+    elif test -z "$(git rev-list $2 ^$1 -n1)"; then
+      echo $1
+    else
+      echo $2 $1
+    fi
+  else
+    local left=$1
+    shift 1
+    set -- $(_reduce-bases "$@")
+    local -a output=()
+    for b in "$@"; do
+      local reduction=$(_reduce-bases "$left" "$b")
+      if test "$reduction" = $b; then
+        echo "$@"
+        return
+      elif ! test "$reduction" = $left; then
+        output=("${output[@]}" "$b")
+      fi
+    done
+    echo "$left" "${output[@]}"
+  fi
+}
+
+_plan() {
+  local head=$1
+  shift 1
+  local limits=("$@")
+
+  _walk "" "$head" "${limits[@]}" | _reverse
+  echo end
+}
+
+_build() {
+  local head=$1
+  local op args
+  local started=false
+  local _base
+  local enable_right_push=${RECURSIVE}
+
+  is_right() {
+    local path=$1
+    test "${path%R}" != "${path}"
+  }
+
+  while read op args; do
+    set -- $args
+    local base=$1
+    local tip=$2
+    local merge=$1
+    local path=$2
+
+    if test "$op" = "pop"; then
+      debug "$op " $args
+    else
+      debug "$op" $args
+    fi
+
+    case "$op" in
+      base)
+        if ! $started; then
+          started=true
+          git checkout -q $1
+          shift 1
+          while test $# -gt 0; do
+            err=$(git merge -q $1 2>&1) || die "build: merge-failed: $err"
+            shift
+          done
+          _base=$(git rev-parse HEAD)
+        fi
+      ;;
+      compensate)
+        base=$1
+        _compensate HEAD $base $tip
+      ;;
+      resolve-merge-conflict)
+        _resolve-merge-conflict $merge
+      ;;
+      push)
+        if $enable_right_push && is_right $path; then
+          local linear
+          linear=$(_atomic build $merge) || exit $?
+          _compensate HEAD $linear
+        fi
+      ;;
+      pop)
+        if test -z "${path//L/}"; then
+          if git diff --exit-code $merge HEAD >/dev/null; then
+            :
+          else
+            die "build: pop: failed to re-establish treesame condition for $merge <=> $(git rev-parse HEAD): $path"
+          fi
+        elif $enable_right_push && is_right $path; then
+          local save=$(git rev-parse HEAD)
+          local all_merged=$(git rev-parse HEAD)
+          git checkout -q $save
+          if git diff --exit-code $merge $all_merged >/dev/null; then
+            :
+          else
+            die "build: pop: failed to re-establish treesame condition for $merge <=> $(git rev-parse HEAD): $path"
+          fi
+          break;
+        fi
+      ;;
+      end)
+        if ! diff=$(git diff --full-index HEAD $head --exit-code); then
+          echo "$diff" | git apply -q --index &&
+          git commit -q --no-verify --allow-empty -m "COMPENSATION: final-fixup: $head"
+        fi
+      ;;
+    esac
+  done
+  echo $_base $(git rev-parse HEAD)
+}
+
+_linearize() {
+  _thunk() {
+    local head=$1
+    shift 1
+    _plan "$head" "$@" | _build "$head" || exit $?
+  }
+
+  _atomic thunk "$@"
+}
+
+_main() {
+  local ON_CONFLICT=${ON_CONFLICT:-merge}
+  local RECURSIVE=${RECURSIVE:-true}
+  local update_head=false
+  local -a heads=() limits=()
+  while test $# -gt 0; do
+    local arg=$1
+    shift 1
+    case "$arg" in
+      --debug)
+          DEBUG=true
+      ;;
+      --recursive)
+          RECURSIVE=true
+      ;;
+      --no-recursive)
+          RECURSIVE=false
+      ;;
+      --on-conflict)
+          if test $# -gt 0; then
+            ON_CONFLICT=$1
+            shift 1
+          fi
+          case "$ON_CONFLICT" in
+            split|merge)
+              :
+            ;;
+            *)
+              die "usage: --on-conflict split|merge"
+            ;;
+          esac
+      ;;
+      --update-head)
+        update_head=true
+      ;;
+      ^*)
+        limits=("${limits[@]}" $arg)
+      ;;
+      *)
+        if test "${#heads}" -ne 0; then
+          die "too many heads specified"
+        fi
+        heads=(${heads[@]} $arg)
+      ;;
+      --)
+        break;
+      ;;
+    esac
+  done
+
+  if test "${#heads}" -eq 0; then
+    heads=(HEAD)
+  fi
+
+  if test $# -gt 0; then
+    dispatch "$@" 3>/dev/stderr
+  else
+    local output
+    output=$(_linearize "${heads[0]}" "${limits[@]}") || exit $?
+    if $update_head; then
+      set -- $output
+      git reset -q --hard $2
+    else
+      echo $output
+    fi
+  fi
+}
+
+_main "$@"

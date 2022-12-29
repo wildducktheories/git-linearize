@@ -1,0 +1,58 @@
+SHELL=bash
+MESSAGE=$(shell cat file | sed "s/^[0-9]*://" | tr \\012 , | sed 's/,$$//')
+MESSAGE2=$(shell )
+
+L_1=A
+L_2=A
+L_3=A
+L_4=A
+L_5=A
+
+MERGE_OPTION=ours
+GRAPH=graph
+
+init: .git
+
+.git:
+	git init
+	git add Makefile
+	git commit -m "initial commit"
+	make update
+	git tag initial HEAD
+
+message:
+	@cat file | sed "s/^[0-9]*://" | tr \\012 , | sed 's/,$$//'
+
+update:
+	echo -e "1:$(L_1)\n2:$(L_2)\n3:$(L_3)\n4:$(L_4)\n5:$(L_5)" > file
+	git add file
+	git commit --allow-empty -m "$(L_1),$(L_2),$(L_3),$(L_4),$(L_5)"
+
+merge:
+	@echo git merge -s ort -X $(MERGE_OPTION) -m "$(MESSAGE)" $(COMMIT)
+	git merge -s ort -X $(MERGE_OPTION) -m "$(MESSAGE)" $(COMMIT)
+	git commit --amend -m "$$(make message)"
+
+graph: init
+	git checkout -B C initial
+	make update L_3=C L_5=C
+	git checkout -B B initial
+	make update L_3=B
+	make merge COMMIT=C MERGE_OPTION=theirs
+	git checkout -B D HEAD
+	make update L_3=D L_5=C
+	git checkout -B E initial
+	make update L_3=E
+	make merge COMMIT=D MERGE_OPTION=ours
+	make update L_3=D L_5=C
+	git reset --soft HEAD^1
+	git commit --amend -m "$$(make message)"
+
+plan:
+	make $(GRAPH)
+	git linearize -- plan E ^initial
+
+test:
+	make $(GRAPH)
+	git rev-parse E
+	git linearize E ^initial
