@@ -126,6 +126,13 @@ _cherry-pick() {
 
   if ! err=$(git cherry-pick --keep-redundant-commits $c 2>&1); then
     git cherry-pick --abort
+    if $RECURSIVE; then
+      local subject=$(git log --format="%s" $c -n1 | sed -n "/^COMPENSATION: ours-theirs: /p")
+      if test -n "$subject"; then
+        debug "drop conflicted compensation commit"
+        return
+      fi
+    fi
     err=$(git cherry-pick --allow-empty --keep-redundant-commits --strategy ort -X ours $c 2>&1) || {
         debug "$err" 1>&2
         git cherry-pick --abort
@@ -142,7 +149,7 @@ _cherry-pick() {
       }
 
       git diff --full-index HEAD $ours -- | git apply -q --index --allow-empty &&
-      git commit -q --no-verify --allow-empty -m "COMPENSATION: prefer-ours: $c" || {
+      git commit -q --no-verify --allow-empty -m "COMPENSATION: ours-theirs: $c" || {
         git reset --hard HEAD
         die "compensate: fixup diff failed: $c"
       }
